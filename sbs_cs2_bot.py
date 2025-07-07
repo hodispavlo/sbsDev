@@ -121,17 +121,35 @@
 # if __name__ == "__main__":
 #     main()
 
-
-
 import feedparser
 import openai
 import time
 import requests
+import os
+import logging
+from logging.handlers import RotatingFileHandler
+import pickle
 
+SEEN_LINKS_FILE = "seen_links.pkl"
 
-openai.api_key        = "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"
-TELEGRAM_TOKEN        = "7704067333:AAFmimt4u0Ka8PFGrBmR6Yya3sdXFJwZFwU"
-CHANNEL_USERNAME      = "@testSBScs2"
+#For saving links(release)
+# def load_seen_links():
+#     if os.path.exists(SEEN_LINKS_FILE):
+#         with open(SEEN_LINKS_FILE, "rb") as f:
+#             return pickle.load(f)
+#     return set()
+#
+# def save_seen_links():
+#     with open(SEEN_LINKS_FILE, "wb") as f:
+#         pickle.dump(seen_links, f)
+
+#seen_links = load_seen_links()
+
+from dotenv import load_dotenv
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME")
 RSS_URLS              = [
     "https://www.hltv.org/rss/news",
     "https://liquipedia.net/counterstrike/Special:RecentChanges?feed=rss",
@@ -140,15 +158,39 @@ RSS_URLS              = [
 CHECK_INTERVAL        = 600  # 10 минут
 seen_links            = set()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        RotatingFileHandler("bot.log", maxBytes=5_000_000, backupCount=5),
+        logging.StreamHandler()
+    ]
+)
+
+#Trim publications
+def smart_trim(text: str, limit: int = 4096) -> str:
+    if len(text) <= limit:
+        return text
+
+    trimmed = text[:limit]
+
+    for punct in ['.', '!', '?', '\n']:
+        idx = trimmed.rfind(punct)
+        if idx != -1 and idx > limit * 0.7:
+            return trimmed[:idx + 1].strip()
+
+    return trimmed.strip()
 
 def fetch_rss_entries():
     entries = []
     for url in RSS_URLS:
         try:
             feed = feedparser.parse(url)
+            if not feed.entries:
+                logging.warning(f"No entries found in feed: {url}")
             entries.extend(feed.entries)
-        except Exception:
-            continue
+        except Exception as e:
+            logging.error(f"Failed to fetch RSS from {url}: {e}")
     return entries
 
 
@@ -163,10 +205,11 @@ def extract_image_url(entry):
 
 
 def summarize_entry(entry):
-    title   = entry.title
+    title = getattr(entry, "title", "")
     summary = getattr(entry, "summary", "")
+    #link = getattr(entry, "link", "")
     content = f"{title}\n{summary}"
-
+    logging.info(f"Generating summary for: {title}")
     prompt = f"""
 
 You are the editor of an esports Telegram channel — SBS CS2 — focused on CS2.
@@ -210,20 +253,31 @@ Input:
             temperature=0.8,
             max_tokens=600,
         )
+
         text = completion.choices[0].message.content.strip()
+
+        usage = completion.usage
+
+        logging.info(
+            f"OpenAI usage: prompt_tokens={usage['prompt_tokens']}, "
+            f"completion_tokens={usage['completion_tokens']}, "
+            f"total_tokens={usage['total_tokens']}"
+        )
     except Exception as e:
-        text = f"[OpenAI Error] {e}"
+        logging.error(f"OpenAI error: {e}")
+        return "[Ошибка генерации текста]", None
 
     image_url = extract_image_url(entry)
     return text, image_url
 
 
 def post_to_telegram(text, image_url=None):
-    if image_url:
+    #The length of descriptions for media files in a Telegram is limited to 999 characters
+    if image_url and len(text)<=999:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
         payload = {
             "chat_id": CHANNEL_USERNAME,
-            "caption": text,
+            "caption":  smart_trim(text, 999),
             "photo": image_url,
             "parse_mode": "HTML"
         }
@@ -231,27 +285,45 @@ def post_to_telegram(text, image_url=None):
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {
             "chat_id": CHANNEL_USERNAME,
-            "text": text,
+    # The length of publication in a Telegram is limited to 4096 characters
+            #"text": text[:4096],
+            "text": smart_trim(text, 4096),
             "parse_mode": "HTML"
         }
 
     try:
         resp = requests.post(url, data=payload)
         if not resp.ok:
-            print("[Telegram Error]", resp.text)
+            logging.error(f"Telegram error: {resp.text}")
+        else:
+            logging.info("Message posted to Telegram successfully.")
     except Exception as e:
-        print("[Send Failed]", e)
+        logging.exception(f"Failed to send message to Telegram: {e}")
 
 
 def main():
     while True:
-        for entry in fetch_rss_entries():
-            if entry.link not in seen_links:
-                seen_links.add(entry.link)
-                text, img = summarize_entry(entry)
-                post_to_telegram(text, img)
-                time.sleep(2)
+        #Error with OpenAI
+        try:
+            entries = fetch_rss_entries()
+            for entry in entries:
+                if entry.link not in seen_links:
+                    seen_links.add(entry.link)
+                    #save_seen_links()
+                    #release save links
+                    logging.info(f"New entry detected: {entry.link}")
+                    text, img = summarize_entry(entry)
+                    post_to_telegram(text, img)
+                    time.sleep(2)
+        except Exception as e:
+            logging.exception("Error during RSS processing loop")
+        logging.info(f"Sleeping for {CHECK_INTERVAL} seconds...")
         time.sleep(CHECK_INTERVAL)
 
+
 if __name__ == "__main__":
+    logging.info("Bot started. Monitoring RSS feeds...")
     main()
+
+
+
