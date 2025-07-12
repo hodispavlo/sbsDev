@@ -1,64 +1,70 @@
-import datetime
-import json
-import logging
-import os
 import re
+import os
+import json
 import time
-from logging.handlers import RotatingFileHandler
-
+import logging
 import feedparser
 import openai
 import requests
+from urllib.parse import quote_plus
 from dateutil.parser import parse
-from dotenv import load_dotenv
-
-load_dotenv()
-
-SEEN_TIME_FILE = "seen_time.json"
+from datetime import timezone
+import boto3
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME")
+S3_BUCKET = os.getenv("S3_BUCKET", "cs2-news-bot-data")
+S3_KEY = "last_seen.json"
+
 RSS_URLS = [
     "https://www.hltv.org/rss/news",
     "https://liquipedia.net/counterstrike/Special:RecentChanges?feed=rss",
     "https://www.reddit.com/r/GlobalOffensive/.rss"
 ]
-CHECK_INTERVAL = 600
-seen_links = set()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        RotatingFileHandler("bot.log", maxBytes=5_000_000, backupCount=5),
-        logging.StreamHandler()
-    ]
-)
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+s3 = boto3.client("s3")
 
 
-def smart_trim(text: str, limit: int = 4096) -> str:
+def get_s3_key_for_url(url: str) -> str:
+    return f"last_seen/{quote_plus(url)}.json"
+
+
+def load_last_seen(url: str) -> str:
+    key = get_s3_key_for_url(url)
+    try:
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        return json.loads(obj["Body"].read())
+    except s3.exceptions.NoSuchKey:
+        return "1970-01-01T00:00:00Z"
+
+
+def save_last_seen(url: str, timestamp: str):
+    key = get_s3_key_for_url(url)
+    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=json.dumps(timestamp))
+
+
+def smart_trim(text, limit=4096):
     if len(text) <= limit:
         return text
-
     trimmed = text[:limit]
-
     for punct in ['.', '!', '?', '\n']:
         idx = trimmed.rfind(punct)
         if idx != -1 and idx > limit * 0.7:
             return trimmed[:idx + 1].strip()
-
     return trimmed.strip()
 
 
-def fetch_rss_entries(url: str):
+def fetch_rss_entries(url):
     try:
         feed = feedparser.parse(url)
-        if not feed.entries:
-            logging.warning(f"No entries found in feed: {url}")
-        return feed.entries
+        return feed.entries or []
     except Exception as e:
-        logging.error(f"Failed to fetch RSS from {url}: {e}")
+        logger.error(f"Failed to fetch {url}: {e}")
+        return []
 
 
 def extract_image_url(entry):
@@ -75,7 +81,7 @@ def summarize_entry(entry):
     title = getattr(entry, "title", "")
     summary = getattr(entry, "summary", "")
     content = f"{title}\n{summary}"
-    logging.info(f"Generating summary for: {title}")
+
     prompt = f"""
 
 You are the editor of an esports Telegram channel — SBS CS2 — focused on CS2.
@@ -106,14 +112,15 @@ Important aspects for parsing and use:
   - Data freshness: Check how recent the information in the news item is to avoid publishing outdated facts.
 
   - Statistic extraction: Automatically find and extract statistical data (e.g., match scores, win rates, kill counts) for use in the post.
-  
+
   - Important: The final post must be no more than 300 characters and if the news item includes an image, do NOT include the link in the message text at all. Instead, return it separately in a field named image_url. Do not wrap it in parentheses or include it in the body of the post.
 
  Source verification: Where possible, verify the reliability of information, especially for rumors or unconfirmed data.
  Reply with only the final post, no commentary or explanation.
 Input:
 {content}
-"""
+    """
+
     try:
         completion = openai.ChatCompletion.create(
             model="gpt-4o",
@@ -121,30 +128,25 @@ Input:
             temperature=0.8,
             max_tokens=600,
         )
-
         text = completion.choices[0].message.content.strip()
         usage = completion.usage
-
-        logging.info(
+        logger.info(
             f"OpenAI usage: prompt_tokens={usage['prompt_tokens']}, "
             f"completion_tokens={usage['completion_tokens']}, "
             f"total_tokens={usage['total_tokens']}"
         )
     except Exception as e:
-        logging.error(f"OpenAI error: {e}")
+        logger.error(f"OpenAI error: {e}")
         return "[Ошибка генерации текста]", None
 
     image_url = extract_image_url(entry)
-
     text_lines = text.splitlines()
     filtered_lines = []
     for line in text_lines:
         line_strip = line.strip().lower()
-        if line_strip.startswith("image_url"):
+        if line_strip.startswith("image_url") or line_strip.startswith("(image_url") or line_strip.startswith("изображение"):
             continue
-        if line_strip.startswith("Изображение"):
-            continue
-        if re.search(r'\(https?://[^)]+\)', line):  # (https://...)
+        if re.search(r'\(https?://[^)]+\)', line):
             continue
         filtered_lines.append(line)
 
@@ -153,89 +155,74 @@ Input:
 
 
 def post_to_telegram(text, image_url=None):
-    if image_url and len(text) <= 999:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-        payload = {
-            "chat_id": CHANNEL_USERNAME,
-            "caption": smart_trim(text, 999),
-            "photo": image_url,
-            "parse_mode": "HTML"
-        }
-    else:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": CHANNEL_USERNAME,
-            "text": smart_trim(text, 4096),
-            "parse_mode": "HTML"
-        }
-
     try:
+        if image_url and len(text) <= 999:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+            payload = {
+                "chat_id": CHANNEL_USERNAME,
+                "caption": smart_trim(text, 999),
+                "photo": image_url,
+                "parse_mode": "HTML"
+            }
+        else:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            payload = {
+                "chat_id": CHANNEL_USERNAME,
+                "text": smart_trim(text, 4096),
+                "parse_mode": "HTML"
+            }
+
         resp = requests.post(url, data=payload)
         if not resp.ok:
-            logging.error(f"Telegram error: {resp.text}")
+            logger.error(f"Telegram error: {resp.text}")
         else:
-            logging.info("Message posted to Telegram successfully.")
+            logger.info("Message posted to Telegram successfully.")
     except Exception as e:
-        logging.exception(f"Failed to send message to Telegram: {e}")
+        logger.exception(f"Failed to send message to Telegram: {e}")
 
 
-def main():
-    while True:
-        try:
-            last_seen = {}
-            if os.path.exists('last_seen.json'):
-                with open('last_seen.json', 'r') as f:
-                    last_seen = json.load(f)
+def lambda_handler(event, context):
+    logger.info("Lambda started. Monitoring RSS feeds...")
+    seen_links = set()
 
-            for url in RSS_URLS:
-                entries = fetch_rss_entries(url)
-                latest_seen_str = last_seen.get(url, '1970-01-01T00:00:00Z')
-                latest_seen = parse(latest_seen_str).astimezone(datetime.timezone.utc)
+    for url in RSS_URLS:
+        entries = fetch_rss_entries(url)
+        latest_seen_str = load_last_seen(url)
+        latest_seen = parse(latest_seen_str).astimezone(timezone.utc)
 
-                entries.sort(
-                    key=lambda ent: parse(
-                        getattr(ent, "pubDate", "") or getattr(ent, "updated", "") or "1970-01-01T00:00:00Z"
-                    )
-                )
+        entries.sort(
+            key=lambda ent: parse(
+                getattr(ent, "pubDate", "") or getattr(ent, "updated", "") or "1970-01-01T00:00:00Z"
+            )
+        )
 
-                for entry in entries:
-                    if entry.link in seen_links:
-                        continue
-                    seen_links.add(entry.link)
+        for entry in entries:
+            if entry.link in seen_links:
+                continue
+            seen_links.add(entry.link)
 
-                    publish_time = getattr(entry, "pubDate", "") or getattr(entry, "updated", "")
-                    if not publish_time:
-                        continue
-                    publish_time = parse(publish_time)
-                    if publish_time.tzinfo is None:
-                        publish_time = publish_time.replace(tzinfo=datetime.timezone.utc)
-                    else:
-                        publish_time = publish_time.astimezone(datetime.timezone.utc)
+            publish_time = getattr(entry, "pubDate", "") or getattr(entry, "updated", "")
+            if not publish_time:
+                continue
+            publish_time = parse(publish_time)
+            if publish_time.tzinfo is None:
+                publish_time = publish_time.replace(tzinfo=timezone.utc)
+            else:
+                publish_time = publish_time.astimezone(timezone.utc)
 
-                    if publish_time < latest_seen:
-                        logging.info(f'Skipped entry (Already parsed): {entry.link}')
-                        continue
+            if publish_time < latest_seen:
+                logger.info(f'Skipped entry (Already parsed): {entry.link}')
+                continue
 
-                    logging.info(f"New entry detected: {entry.link} [{publish_time}]")
-                    text, img = summarize_entry(entry)
-                    if "Извините," in text:
-                        logging.info(f"Пропущен пост: недостаточно информации для {entry.link}")
-                        continue
-                    post_to_telegram(text, img)
-                    time.sleep(10)
+            logger.info(f"New entry detected: {entry.link} [{publish_time}]")
+            text, img = summarize_entry(entry)
+            if "Извините," in text:
+                logger.info(f"Пропущен пост: недостаточно информации для {entry.link}")
+                continue
+            post_to_telegram(text, img)
+            time.sleep(10)
 
-                    latest_seen = publish_time
-                    last_seen[url] = latest_seen.isoformat()
-                    with open('last_seen.json', 'w') as f:
-                        json.dump(last_seen, f, indent=2)
+            latest_seen = publish_time
+            save_last_seen(url, latest_seen.isoformat())
 
-
-        except Exception as e:
-            logging.exception("Error during RSS processing loop")
-        logging.info(f"Sleeping for {CHECK_INTERVAL} seconds...")
-        time.sleep(CHECK_INTERVAL)
-
-
-if __name__ == "__main__":
-    logging.info("Bot started. Monitoring RSS feeds...")
-    main()
+    logger.info("Lambda finished")
